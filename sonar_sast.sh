@@ -27,6 +27,7 @@ SONAR_CONTAINER_NAME="sonarqube-sast-temp"    # Name for the SonarQube Docker co
 SONAR_PROJECT_KEY="my-sast-project"           # Unique key for your SonarQube project
 SONAR_PROJECT_NAME="My SAST Project"         # Display name for your SonarQube project
 DOCKER_NETWORK_NAME="sonarqube-sast-network"  # Custom Docker network for inter-container communication
+: "${SRC_TO_SCAN:=$(pwd)}" # Source code directory to be scanned (current directory by default)
 
 # --- Internal Variables (Do not modify unless you know what's going on) ---
 # We will now use a single GLOBAL_ANALYSIS_TOKEN for both API calls and scanner
@@ -134,9 +135,11 @@ run_sonarqube_scanner() {
         -e SONAR_HOST_URL="${SONAR_QUBE_INTERNAL_HOST}" \
         -e SONAR_TOKEN="${GLOBAL_ANALYSIS_TOKEN}" \
         -e SONAR_SCANNER_OPTS="-Xmx512m" \
-        -v "$(pwd):/usr/src" \
+        -v "${SRC_TO_SCAN}:/usr/src" \
+        -v "$(pwd)/.scannerwork:/tmp/.scannerwork" \
         sonarsource/sonar-scanner-cli:latest \
-        -Dsonar.analysis.jsonReport.enable=true -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+        -Dsonar.scanner.keepReport=true \
+        -Dsonar.projectKey="${SONAR_PROJECT_KEY}"      
 
     # Extract analysis ID from the generated report-task.txt
     if [ ! -f ".scannerwork/report-task.txt" ]; then
@@ -164,8 +167,8 @@ wait_for_analysis_completion() {
             echo "SonarQube analysis task status: $STATUS"
             break
         fi
-        echo "Analysis still in progress ($STATUS), waiting 5 seconds... (Attempt $i/120)"
-        sleep 5
+        echo "Analysis still in progress ($STATUS), waiting 10 seconds... (Attempt $i/120)"
+        sleep 10
     done
 
     if [ "$STATUS" != "SUCCESS" ]; then
