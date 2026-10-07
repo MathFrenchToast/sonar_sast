@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+from html import escape
 
 def generate_html_report(issues_file, metrics_file, output_file, project_name):
     """
@@ -29,13 +30,40 @@ def generate_html_report(issues_file, metrics_file, output_file, project_name):
     except json.JSONDecodeError:
         print(f"Warning: Could not decode JSON from {metrics_file}. No metrics will be included.")
 
+    issue_limit = int(os.environ.get('SONAR_ISSUE_LIMIT', '50'))
+    escaped_project_name = escape(str(project_name))
+    html_rows = ""
+    for issue in issues[:issue_limit]:
+        severity = escape(str(issue.get('severity', 'INFO')))
+        issue_type = escape(str(issue.get('type', 'N/A')))
+        message = escape(str(issue.get('message', 'N/A')))
+        component = str(issue.get('component', '')).split(':')[-1]
+        file_name = escape(component.replace(str(project_name) + '/', ''))
+        line = escape(str(issue.get('textRange', {}).get('startLine', 'N/A')))
+        html_rows += f'''
+                        <tr class="border-b border-gray-200 hover:bg-gray-100">
+                            <td class="py-3 px-6 whitespace-nowrap"><span class="severity-{severity}">{severity}</span></td>
+                            <td class="py-3 px-6">{issue_type}</td>
+                            <td class="py-3 px-6">{message}</td>
+                            <td class="py-3 px-6">{file_name}</td>
+                            <td class="py-3 px-6">{line}</td>
+                        </tr>
+                        '''
+
+    if not issues:
+        html_rows = '''
+                        <tr>
+                            <td colspan="5" class="py-3 px-6 text-center text-gray-500">No issues found.</td>
+                        </tr>
+                        '''
+
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SonarQube SAST Report - {project_name}</title>
+        <title>SonarQube SAST Report - {escaped_project_name}</title>
         <!-- Tailwind CSS for modern styling -->
         <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
         <style>
@@ -69,7 +97,7 @@ def generate_html_report(issues_file, metrics_file, output_file, project_name):
                 SonarQube SAST Report
             </h1>
             <p class="text-lg text-gray-600 mb-8 text-center">
-                Analysis for project: <span class="font-semibold">{project_name}</span>
+                Analysis for project: <span class="font-semibold">{escaped_project_name}</span>
             </p>
 
             <!-- Metrics Overview Section -->
@@ -120,27 +148,14 @@ def generate_html_report(issues_file, metrics_file, output_file, project_name):
                         </tr>
                     </thead>
                     <tbody class="text-gray-600 text-sm font-light">
-                        {"".join([f'''
-                        <tr class="border-b border-gray-200 hover:bg-gray-100">
-                            <td class="py-3 px-6 whitespace-nowrap"><span class="severity-{issue.get('severity', 'INFO')}">{issue.get('severity', 'N/A')}</span></td>
-                            <td class="py-3 px-6">{issue.get('type', 'N/A')}</td>
-                            <td class="py-3 px-6">{issue.get('message', 'N/A')}</td>
-                            <td class="py-3 px-6">{issue.get('component', '').split(':')[-1].replace(project_name + '/', '')}</td>
-                            <td class="py-3 px-6">{issue.get('textRange', {}).get('startLine', 'N/A')}</td>
-                        </tr>
-                        ''' for issue in issues[:50]])} <!-- Limiting to top 50 issues for brevity in the report -->
-                        {"".join([f'''
-                        <tr>
-                            <td colspan="5" class="py-3 px-6 text-center text-gray-500">No issues found.</td>
-                        </tr>
-                        ''' if not issues else ''])}
+                        {html_rows}
                     </tbody>
                 </table>
             </div>
 
             <!-- Footer with report generation details -->
             <div class="mt-10 text-center text-gray-500 text-sm">
-                Report generated for: {project_name}
+                Report generated for: {escaped_project_name}
                 <br>
                 For full details and interactive exploration, visit the SonarQube dashboard at {os.environ.get('SONAR_QUBE_HOST', '#')}
                 (Note: The SonarQube server is ephemeral and will be shut down after the script completes).

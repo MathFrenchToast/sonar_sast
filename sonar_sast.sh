@@ -14,20 +14,43 @@
 # Usage:
 #   ./sonarqube_sast_scan.sh
 #
-# Customize the SONAR_PROJECT_KEY and SONAR_PROJECT_NAME variables below
-# to match your project.
+# Override SONAR_PROJECT_KEY and SONAR_PROJECT_NAME through the environment
+# to identify the scanned project.
 
 # Exit immediately if a command exits with a non-zero status.
 set -e
-set -x # Enable debugging: print commands and their arguments as they are executed
+
+# Set SCAN_DEBUG=1 to print commands as they are executed; debugging is off by default.
+: "${SCAN_DEBUG:=0}"
+case "${SCAN_DEBUG}" in
+    0) ;;
+    1) set -x ;;
+    *)
+        echo "Error: SCAN_DEBUG must be 0 or 1."
+        exit 1
+        ;;
+esac
 
 # --- Configuration Variables ---
 SONAR_QUBE_HOST="http://localhost:9000"       # SonarQube will be accessible on this host port
 SONAR_CONTAINER_NAME="sonarqube-sast-temp"    # Name for the SonarQube Docker container
-SONAR_PROJECT_KEY="my-sast-project"           # Unique key for your SonarQube project
-SONAR_PROJECT_NAME="My SAST Project"         # Display name for your SonarQube project
+# These can be overridden with environment variables for a single run.
+: "${SONAR_PROJECT_KEY:=my-sast-project}"      # Unique key for your SonarQube project
+: "${SONAR_PROJECT_NAME:=My SAST Project}"     # Display name for your SonarQube project
 DOCKER_NETWORK_NAME="sonarqube-sast-network"  # Custom Docker network for inter-container communication
 : "${SRC_TO_SCAN:=$(pwd)}" # Source code directory to be scanned (current directory by default)
+if [[ ! -d "${SRC_TO_SCAN}" ]]; then
+    echo "Error: SRC_TO_SCAN is not an existing directory: ${SRC_TO_SCAN}"
+    exit 1
+fi
+SRC_TO_SCAN="$(cd "${SRC_TO_SCAN}" && pwd -P)"
+# Comma-separated SonarQube issue types to include in the report.
+# Valid values: BUG, VULNERABILITY, CODE_SMELL.
+: "${SONAR_ISSUE_TYPES:=BUG,VULNERABILITY,CODE_SMELL}"
+# Maximum number of matching issues retrieved and displayed (SonarQube API maximum: 500).
+: "${SONAR_ISSUE_LIMIT:=50}"
+# Docker image used when a .NET solution is detected. Override it for a specific SDK version.
+: "${DOTNET_SDK_IMAGE:=mcr.microsoft.com/dotnet/sdk:latest}"
 
 # --- Internal Variables (Do not modify unless you know what's going on) ---
 # We will now use a single GLOBAL_ANALYSIS_TOKEN for both API calls and scanner
@@ -37,6 +60,13 @@ REPORT_HTML_FILE="sonarqube_sast_report.html"
 SONAR_ANALYSIS_LOGS_FILE="sonar_analysis_logs.txt"
 # Internal host for scanner to reach SonarQube within the Docker network
 SONAR_QUBE_INTERNAL_HOST="http://sonarqube:9000"
+DOTNET_SOLUTION_FILES=()
+
+if ! [[ "${SONAR_ISSUE_LIMIT}" =~ ^[1-9][0-9]*$ ]] || (( SONAR_ISSUE_LIMIT > 500 )); then
+    echo "Error: SONAR_ISSUE_LIMIT must be an integer between 1 and 500."
+    exit 1
+fi
+export SONAR_ISSUE_LIMIT
 
 # --- Functions ---
 
@@ -95,7 +125,6 @@ setup_sonarqube_api() {
     curl -s -u admin:admin -X POST "${SONAR_QUBE_HOST}/api/user_tokens/revoke?name=admin_global_analysis_token" > /dev/null || true
     
     GLOBAL_ANALYSIS_TOKEN=$(curl -s -u admin:admin -X POST "${SONAR_QUBE_HOST}/api/user_tokens/generate?name=admin_global_analysis_token" | jq -r '.token')
-    echo "Raw GLOBAL_ANALYSIS_TOKEN from API call: ${GLOBAL_ANALYSIS_TOKEN}" # Debugging output
     if [ -z "$GLOBAL_ANALYSIS_TOKEN" ] || [ "$GLOBAL_ANALYSIS_TOKEN" == "null" ]; then
         echo "Error: Failed to generate GLOBAL_ANALYSIS_TOKEN. Check SonarQube logs or credentials."
         return 1
@@ -118,35 +147,94 @@ setup_sonarqube_api() {
     return 0
 }
 
+# Find .NET solutions under the selected source directory. A repository may contain
+# several independent modules, so every detected .sln or .slnx file is built.
+find_dotnet_solutions() {
+    DOTNET_SOLUTION_FILES=()
+
+    while IFS= read -r -d '' solution_file; do
+        DOTNET_SOLUTION_FILES+=("${solution_file#"${SRC_TO_SCAN}"/}")
+    done < <(
+        find "${SRC_TO_SCAN}" \
+            \( -type d \( -name .git -o -name .scannerwork -o -name .sonarqube -o -name bin -o -name obj \) -prune \) -o \
+            \( -type f \( -name '*.sln' -o -name '*.slnx' \) -print0 \)
+    )
+}
+
+run_dotnet_scanner() {
+    echo "Detected ${#DOTNET_SOLUTION_FILES[@]} .NET solution file(s); using SonarScanner for .NET."
+    printf '  - %s\n' "${DOTNET_SOLUTION_FILES[@]}"
+
+    docker run --rm \
+        --network "${DOCKER_NETWORK_NAME}" \
+        --user "$(id -u):$(id -g)" \
+        -w /usr/src \
+        -e HOME=/tmp \
+        -e DOTNET_CLI_HOME=/tmp \
+        -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+        -e SONAR_HOST_URL="${SONAR_QUBE_INTERNAL_HOST}" \
+        -e SONAR_TOKEN="${GLOBAL_ANALYSIS_TOKEN}" \
+        -e SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY}" \
+        -e SONAR_PROJECT_NAME="${SONAR_PROJECT_NAME}" \
+        -v "${SRC_TO_SCAN}:/usr/src" \
+        -v "$(pwd)/.scannerwork:/tmp/.scannerwork" \
+        "${DOTNET_SDK_IMAGE}" \
+        bash -ceu '
+            dotnet tool install --tool-path /tmp/sonar-scanner dotnet-sonarscanner
+            /tmp/sonar-scanner/dotnet-sonarscanner begin \
+                /k:"${SONAR_PROJECT_KEY}" \
+                /n:"${SONAR_PROJECT_NAME}" \
+                /d:sonar.host.url="${SONAR_HOST_URL}" \
+                /d:sonar.token="${SONAR_TOKEN}" \
+                /d:sonar.scanner.metadataFilePath=/tmp/.scannerwork/report-task.txt
+            for solution_file in "$@"; do
+                echo "Building ${solution_file}"
+                dotnet build "${solution_file}" --no-incremental
+            done
+            /tmp/sonar-scanner/dotnet-sonarscanner end /d:sonar.token="${SONAR_TOKEN}"
+        ' -- "${DOTNET_SOLUTION_FILES[@]}"
+}
+
 # Function to run the SonarQube scanner
 run_sonarqube_scanner() {
     echo "--- Running SonarQube Scanner ---"
 
     # Ensure .scannerwork directory exists for report-task.txt
     mkdir -p .scannerwork
+    rm -f .scannerwork/report-task.txt
 
-    # Run the SonarQube Scanner using a Docker container
-    # Connect to the custom Docker network so it can reach the SonarQube server
-    # Mount the current directory as /usr/src inside the container
-    # Pass necessary SonarQube properties as parameters
-    # -Dsonar.analysis.jsonReport.enable=true is crucial for fetching detailed results later
-    docker run --rm \
-        --network "${DOCKER_NETWORK_NAME}" \
-        -e SONAR_HOST_URL="${SONAR_QUBE_INTERNAL_HOST}" \
-        -e SONAR_TOKEN="${GLOBAL_ANALYSIS_TOKEN}" \
-        -e SONAR_SCANNER_OPTS="-Xmx512m" \
-        -v "${SRC_TO_SCAN}:/usr/src" \
-        -v "$(pwd)/.scannerwork:/tmp/.scannerwork" \
-        sonarsource/sonar-scanner-cli:latest \
-        -Dsonar.scanner.keepReport=true \
-        -Dsonar.projectKey="${SONAR_PROJECT_KEY}"      
+    find_dotnet_solutions
+    if (( ${#DOTNET_SOLUTION_FILES[@]} > 0 )); then
+        if ! run_dotnet_scanner; then
+            echo "Error: SonarScanner for .NET failed. No analysis was submitted."
+            return 1
+        fi
+    else
+        echo "No .NET solution found; using the generic SonarQube Scanner."
+
+        # Run the generic SonarQube Scanner using a Docker container.
+        if ! docker run --rm \
+            --network "${DOCKER_NETWORK_NAME}" \
+            -e SONAR_HOST_URL="${SONAR_QUBE_INTERNAL_HOST}" \
+            -e SONAR_TOKEN="${GLOBAL_ANALYSIS_TOKEN}" \
+            -e SONAR_SCANNER_OPTS="-Xmx512m" \
+            -v "${SRC_TO_SCAN}:/usr/src" \
+            -v "$(pwd)/.scannerwork:/tmp/.scannerwork" \
+            sonarsource/sonar-scanner-cli:latest \
+            -Dsonar.scanner.keepReport=true \
+            -Dsonar.working.directory=/tmp/.scannerwork \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}"; then
+            echo "Error: The generic SonarQube Scanner failed."
+            return 1
+        fi
+    fi
 
     # Extract analysis ID from the generated report-task.txt
     if [ ! -f ".scannerwork/report-task.txt" ]; then
         echo "Error: .scannerwork/report-task.txt not found. Analysis might not have completed."
-        # debug by listing contents of current directory
-        echo "Current directory contents:"
-        find .
+        # Debug by listing the scanned source directory.
+        echo "Scanned source directory contents:"
+        find "${SRC_TO_SCAN}"
         return 1
     fi
     ANALYSIS_ID=$(grep "ceTaskId" .scannerwork/report-task.txt | cut -d'=' -f2)
@@ -188,7 +276,7 @@ generate_html_report() {
     # Fetch issues and metrics from the SonarQube API
     echo "Fetching issues from SonarQube API..."
     curl -s -H "Authorization: Bearer ${GLOBAL_ANALYSIS_TOKEN}" \
-      "${SONAR_QUBE_HOST}/api/issues/search?projectKeys=${SONAR_PROJECT_KEY}&ps=500" > issues.json || { echo "Failed to fetch issues."; return 1; }
+      "${SONAR_QUBE_HOST}/api/issues/search?projectKeys=${SONAR_PROJECT_KEY}&types=${SONAR_ISSUE_TYPES}&ps=${SONAR_ISSUE_LIMIT}" > issues.json || { echo "Failed to fetch issues."; return 1; }
 
     echo "Fetching metrics from SonarQube API..."
     curl -s -H "Authorization: Bearer ${GLOBAL_ANALYSIS_TOKEN}" \
@@ -243,7 +331,10 @@ wait_for_analysis_completion || exit 1
 # 6. Generate HTML report
 generate_html_report || exit 1
 
+if [[ "${SCAN_DEBUG}" == "1" ]]; then
+    set +x
+fi
+
 echo "--- SonarQube SAST Scan Completed Successfully! ---"
 echo "Your SAST report is available at: ${REPORT_HTML_FILE}"
 echo "SonarQube Compute Engine logs (if any issues): ${SONAR_ANALYSIS_LOGS_FILE}"
-
